@@ -285,7 +285,7 @@ func (r qualityGuardConfigRequest) validate(nodeCount int) error {
 	if r.QuarantineSeconds < 30 || r.QuarantineSeconds > 86400 {
 		return errors.New("隔离时长必须在 30 到 86400 秒之间")
 	}
-	if r.MinHealthyNodes < 1 || r.MinHealthyNodes > nodeCount {
+	if r.MinHealthyNodes < 1 || (nodeCount > 0 && r.MinHealthyNodes > nodeCount) {
 		return errors.New("最少保留节点必须在受管节点数量范围内")
 	}
 	return nil

@@ -428,7 +428,8 @@ const DEFAULT_POLICY: QualityGuardPolicy = {
 function PolicyEditor({ open, onOpenChange, status }: { open: boolean; onOpenChange: (open: boolean) => void; status: QualityGuardStatus }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const nodeCount = status.config?.node_ids.length ?? 1;
+  const nodeCount = status.config?.node_ids.length;
+  const nodeLimit = nodeCount && nodeCount > 0 ? nodeCount : undefined;
   const form = useForm<QualityGuardPolicy>({ resolver: zodResolver(policySchema), defaultValues: policyFromStatus(status) });
   const mode = useWatch({ control: form.control, name: "mode" });
   const softTPS = useWatch({ control: form.control, name: "softTPS" });
@@ -446,7 +447,10 @@ function PolicyEditor({ open, onOpenChange, status }: { open: boolean; onOpenCha
   });
 
   const setMode = (value: QualityGuardPolicy["mode"]) => form.setValue("mode", value, { shouldDirty: true, shouldValidate: true });
-  const resetDefaults = () => form.reset({ ...DEFAULT_POLICY, minHealthyNodes: Math.min(DEFAULT_POLICY.minHealthyNodes, nodeCount) });
+  const resetDefaults = () => form.reset({
+    ...DEFAULT_POLICY,
+    minHealthyNodes: nodeLimit ? Math.min(DEFAULT_POLICY.minHealthyNodes, nodeLimit) : DEFAULT_POLICY.minHealthyNodes,
+  });
 
   return <Dialog open={open} onOpenChange={onOpenChange}>
     <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-2xl">
@@ -466,7 +470,7 @@ function PolicyEditor({ open, onOpenChange, status }: { open: boolean; onOpenCha
           <PolicyField id="guard-soft-strikes" label={t("qualityGuard.consecutiveSoft")} error={form.formState.errors.consecutiveSoft?.message}><Input id="guard-soft-strikes" type="number" min={1} max={20} {...form.register("consecutiveSoft", { valueAsNumber: true })} /></PolicyField>
           <PolicyField id="guard-error-strikes" label={t("qualityGuard.consecutiveErrors")} error={form.formState.errors.consecutiveErrors?.message}><Input id="guard-error-strikes" type="number" min={1} max={20} {...form.register("consecutiveErrors", { valueAsNumber: true })} /></PolicyField>
           <PolicyField id="guard-quarantine-seconds" label={t("qualityGuard.quarantineSeconds")} error={form.formState.errors.quarantineSeconds?.message}><Input id="guard-quarantine-seconds" type="number" min={30} max={86400} step={30} {...form.register("quarantineSeconds", { valueAsNumber: true })} /></PolicyField>
-          <PolicyField id="guard-minimum-nodes" label={t("qualityGuard.minimumNodes")} error={form.formState.errors.minHealthyNodes?.message}><Input id="guard-minimum-nodes" type="number" min={1} max={nodeCount} {...form.register("minHealthyNodes", { valueAsNumber: true, max: nodeCount })} /></PolicyField>
+          <PolicyField id="guard-minimum-nodes" label={t("qualityGuard.minimumNodes")} error={form.formState.errors.minHealthyNodes?.message}><Input id="guard-minimum-nodes" type="number" min={1} max={nodeLimit} {...form.register("minHealthyNodes", { valueAsNumber: true, max: nodeLimit })} /></PolicyField>
         </div>
         {thresholdsInvalid ? <p className="text-xs text-destructive">{t("qualityGuard.softThresholdMustBeLower")}</p> : null}
         <DialogFooter className="gap-2 sm:justify-between">

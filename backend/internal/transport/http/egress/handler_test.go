@@ -128,6 +128,37 @@ func TestUpdateQualityGuardConfigWritesPrivateAtomicFile(t *testing.T) {
 	}
 }
 
+func TestUpdateQualityGuardConfigAllowsDynamicNodeInventory(t *testing.T) {
+	directory := t.TempDir()
+	statePath := directory + "/state.json"
+	configPath := directory + "/runtime-config.json"
+	state := `{"version":1,"guard":{"mode":"hybrid","node_ids":[]},"nodes":{}}`
+	if err := os.WriteFile(statePath, []byte(state), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest("PUT", "/egress-quality-guard/config", bytes.NewBufferString(`{"mode":"hybrid","activeIntervalSeconds":1800,"passivePollSeconds":5,"softTPS":500,"hardTPS":1000,"consecutiveSoft":2,"consecutiveErrors":2,"quarantineSeconds":300,"minHealthyNodes":3}`))
+	context.Request.Header.Set("Content-Type", "application/json")
+
+	NewHandler(nil, statePath, configPath).updateQualityGuardConfig(context)
+
+	if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), `"saved":true`) {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestQualityGuardConfigValidationRejectsKnownNodeLimit(t *testing.T) {
+	request := qualityGuardConfigRequest{
+		Mode: "hybrid", ActiveIntervalSeconds: 1800, PassivePollSeconds: 5,
+		SoftTPS: 500, HardTPS: 1000, ConsecutiveSoft: 2, ConsecutiveErrors: 2,
+		QuarantineSeconds: 300, MinHealthyNodes: 3,
+	}
+	if err := request.validate(2); err == nil {
+		t.Fatal("expected known node inventory to enforce its upper bound")
+	}
+}
+
 func TestUpdateQualityGuardConfigRejectsInvalidAndUnknownFields(t *testing.T) {
 	directory := t.TempDir()
 	statePath := directory + "/state.json"
