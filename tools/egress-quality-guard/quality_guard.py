@@ -370,16 +370,15 @@ def classify_result(result: dict[str, Any], config: Config, profile: dict[str, A
     generation_ms = int(result.get("generationMs") or 0)
     if generation_ms <= 0:
         generation_ms = max(0, int(result.get("durationMs") or 0) - int(result.get("firstTokenMs") or 0))
-    # Marker profiles treat content compliance as the primary signal. A short
-    # QUALITY_OK reply should not be punished for token count or burst TPS.
-    if expected and bool(result.get("expectedMatched")):
-        if output_tokens >= 32 and speed >= config.hard_tps:
-            return "hard", "hard_tps"
-        if output_tokens >= 32 and speed >= config.soft_tps:
-            return "soft", "soft_tps"
-        return "healthy", "within_threshold"
+    # QUALITY_OK is a content marker, not a quality proof. Apply the same
+    # token / window / TPS rules used for user-traffic audits.
     if output_tokens < 32:
         return "soft", "insufficient_output_tokens"
+    reasoning_tokens = max(0, int(result.get("reasoningTokens") or result.get("reasoning_tokens") or 0))
+    if output_tokens >= 64 and reasoning_tokens <= 0:
+        return "hard", "missing_thinking"
+    if config.fail_closed and generation_ms < config.min_generation_ms and speed >= config.soft_tps:
+        return "hard", "buffered_burst"
     if config.fail_closed and generation_ms < config.min_generation_ms:
         return "soft", "insufficient_generation_window"
     if speed >= config.hard_tps:
@@ -432,6 +431,11 @@ def classify_audit(value: dict[str, Any], config: Config) -> tuple[str, str, flo
     if generation_ms <= 0 or output_tokens < 32:
         return "ignored", "insufficient_output_tokens", 0.0, output_tokens
     speed = float(output_tokens) * 1000 / float(generation_ms)
+    reasoning_tokens = max(0, int(value.get("reasoningTokens") or 0))
+    # Backend model swaps often keep a normal 80-200 TPS but drop thinking.
+    # TPS-only rules treat those as healthy.
+    if output_tokens >= 64 and reasoning_tokens <= 0:
+        return "hard", "missing_thinking", speed, output_tokens
     if config.fail_closed and generation_ms < config.min_generation_ms and speed >= config.soft_tps:
         return "hard", "buffered_burst", speed, output_tokens
     if speed >= config.hard_tps:
@@ -461,6 +465,8 @@ def default_node_state() -> dict[str, Any]:
         "last_rotation_exit_ip": "",
         "rotation_failures": 0,
         "last_no_account_log_at": 0.0,
+        "quarantine_source": "",
+        "passive_degrade_repeats": 0,
     }
 
 
@@ -646,7 +652,7 @@ class Guard:
             bool(self.config.rotation_url)
             and node_id in set(self.config.rotatable_node_ids)
             and reason in {
-                "hard_tps", "soft_tps", "buffered_burst", "expected_marker_missing",
+                "hard_tps", "soft_tps", "buffered_burst", "missing_thinking", "expected_marker_missing",
                 "insufficient_output_tokens", "insufficient_generation_window", "probe_errors",
                 "recovery_probe_error", "rotation_error",
             }
@@ -656,7 +662,7 @@ class Guard:
     def _probe_account_unavailable(exc: Exception) -> bool:
         return isinstance(exc, ApiError) and exc.code == "egressQualityProbeNoAccount"
 
-    def _quarantine(self, nodes: list[dict[str, Any]], node: dict[str, Any], reason: str, now: float) -> None:
+    def _quarantine(self, nodes: list[dict[str, Any]], node: dict[str, Any], reason: str, now: float, recover_now: bool = True) -> None:
         node_id = str(node["id"])
         state = self._state_for(node_id)
         if not self._can_quarantine(nodes, node_id):
@@ -664,13 +670,20 @@ class Guard:
             log_event("quarantine_suppressed", node_id=node_id, node_name=node.get("name"), reason=reason, minimum_healthy=self.config.min_healthy_nodes)
             return
         previous_state = dict(state)
+        source = "passive" if not recover_now else "active"
+        repeats = int(state.get("passive_degrade_repeats", 0))
+        if source == "passive":
+            repeats += 1
+        scale = min(8, 2 ** max(0, repeats - 1)) if source == "passive" else 1
         state.update({
             "active_soft_strikes": 0,
             "passive_soft_strikes": 0,
             "error_strikes": 0,
-            "quarantined_until": now + self.config.quarantine_seconds,
+            "quarantined_until": now + self.config.quarantine_seconds * scale,
             "disabled_by_guard": True,
             "last_reason": reason,
+            "quarantine_source": source,
+            "passive_degrade_repeats": repeats if source == "passive" else int(state.get("passive_degrade_repeats", 0)),
         })
         # Persist ownership before changing backend scheduling state. A crash
         # after the API call can then be reconciled safely on restart.
@@ -693,11 +706,37 @@ class Guard:
         self._bump_statistic("actions", "quarantined")
         append_state_event(self.state, "node_quarantined", node_id=node_id, node_name=node.get("name"), reason=reason)
         self._save()
-        log_event("node_quarantined", node_id=node_id, node_name=node.get("name"), reason=reason, quarantine_seconds=self.config.quarantine_seconds)
-        if reason == "buffered_burst":
-            self._recover_quarantined(node, time.time(), rotate=False, rotate_on_failure=True)
+        log_event(
+            "node_quarantined",
+            node_id=node_id,
+            node_name=node.get("name"),
+            reason=reason,
+            quarantine_seconds=self.config.quarantine_seconds,
+            quarantine_hold_seconds=self.config.quarantine_seconds * scale,
+            quarantine_source=source,
+            degrade_repeats=repeats if source == "passive" else 0,
+            recover_now=recover_now,
+        )
+        if recover_now:
+            if reason == "buffered_burst":
+                self._recover_quarantined(node, time.time(), rotate=False, rotate_on_failure=True)
+            elif self._should_rotate(node_id, reason):
+                self._recover_quarantined(node, time.time(), rotate=True)
         elif self._should_rotate(node_id, reason):
-            self._recover_quarantined(node, time.time(), rotate=True)
+            try:
+                rotation = self.api.rotate_node(node_id, str(node.get("exitIp") or ""))
+            except Exception as exc:
+                state["rotation_failures"] = int(state.get("rotation_failures", 0)) + 1
+                log_event("node_rotation_failed", node_id=node_id, node_name=node.get("name"), error_type=type(exc).__name__, trigger="passive_hold")
+            else:
+                state.update({
+                    "last_rotation_at": time.time(),
+                    "last_rotation_exit_ip": str(rotation.get("newExitIp") or ""),
+                    "rotation_failures": 0,
+                })
+                append_state_event(self.state, "node_rotated", node_id=node_id, node_name=node.get("name"), exit_ip=str(rotation.get("newExitIp") or ""))
+                self._save()
+                log_event("node_rotated", node_id=node_id, node_name=node.get("name"), exit_ip=str(rotation.get("newExitIp") or ""), trigger="passive_hold")
 
     def _record_probe(self, node: dict[str, Any], result: dict[str, Any], classification: str, reason: str, now: float) -> None:
         node_id = str(node["id"])
@@ -714,6 +753,7 @@ class Guard:
             "last_classification": classification,
             "last_output_tps": round(output_tps, 3),
             "last_output_tokens": output_tokens,
+            "last_reasoning_tokens": max(0, int(result.get("reasoningTokens") or result.get("reasoning_tokens") or 0)),
             "last_first_token_ms": int(result.get("firstTokenMs") or 0),
             "last_duration_ms": int(result.get("durationMs") or 0),
         })
@@ -735,6 +775,7 @@ class Guard:
             reason=reason,
             output_tps=round(output_tps, 3),
             output_tokens=output_tokens,
+            reasoning_tokens=max(0, int(result.get("reasoningTokens") or result.get("reasoning_tokens") or 0)),
             first_token_ms=int(result.get("firstTokenMs") or 0),
             duration_ms=int(result.get("durationMs") or 0),
             chunk_count=int(result.get("chunkCount") or 0),
@@ -827,6 +868,7 @@ class Guard:
             if rotate_on_failure and self._should_rotate(node_id, reason):
                 self._recover_quarantined(node, time.time(), rotate=True)
             return
+        after_passive = self._is_passive_quarantine(state)
         updated = self.api.set_enabled(node_id, True)
         if updated != 1:
             log_event("restore_not_applied", node_id=node_id, node_name=node.get("name"), updated=updated)
@@ -838,11 +880,29 @@ class Guard:
             "quarantined_until": 0.0,
             "disabled_by_guard": False,
             "last_reason": "",
+            "quarantine_source": "",
         })
         node["enabled"] = True
         self._bump_statistic("actions", "restored")
         append_state_event(self.state, "node_restored", node_id=node_id, node_name=node.get("name"), reason="quality_probe_healthy")
-        log_event("node_restored", node_id=node_id, node_name=node.get("name"), connectivity_status=connectivity_status)
+        log_event(
+            "node_restored",
+            node_id=node_id,
+            node_name=node.get("name"),
+            connectivity_status=connectivity_status,
+            reason="quality_probe_healthy",
+            after_passive_hold=after_passive,
+            expected_matched=bool(result.get("expectedMatched")),
+        )
+
+    @staticmethod
+    def _is_passive_quarantine(state: dict[str, Any]) -> bool:
+        source = str(state.get("quarantine_source") or "")
+        if source == "passive":
+            return True
+        if source == "active":
+            return False
+        return str(state.get("last_source") or "") == "passive"
 
     def _probe_quarantined(self, node: dict[str, Any], now: float) -> None:
         node_id = str(node["id"])
@@ -850,11 +910,15 @@ class Guard:
         if now < float(state.get("quarantined_until", 0.0)):
             return
         reason = str(state.get("last_reason") or "")
+        passive = self._is_passive_quarantine(state)
+        # Dual probe: user traffic isolates immediately; after the hold a
+        # QUALITY_OK probe must come back healthy before restore. Passive
+        # isolate already rotated, so only rotate again if the probe fails.
         self._recover_quarantined(
             node,
             now,
-            rotate=self._should_rotate(node_id, reason) and reason != "buffered_burst",
-            rotate_on_failure=reason == "buffered_burst",
+            rotate=(not passive) and self._should_rotate(node_id, reason) and reason != "buffered_burst",
+            rotate_on_failure=passive or reason == "buffered_burst",
         )
 
     def _prepare_nodes(self, now: float) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[str]]:
@@ -908,15 +972,16 @@ class Guard:
                     updated = self.api.set_enabled(node_id, False)
                     if updated == 1:
                         node["enabled"] = False
-                        state["quarantined_until"] = now + self.config.quarantine_seconds
                         log_event("operator_reenable_requires_probe", node_id=node_id, node_name=node.get("name"))
-                        reason = str(state.get("last_reason") or "")
-                        self._recover_quarantined(
-                            node,
-                            now,
-                            rotate=self._should_rotate(node_id, reason) and reason != "buffered_burst",
-                            rotate_on_failure=reason == "buffered_burst",
-                        )
+                        if now >= float(state.get("quarantined_until", 0.0)):
+                            reason = str(state.get("last_reason") or "")
+                            passive = self._is_passive_quarantine(state)
+                            self._recover_quarantined(
+                                node,
+                                now,
+                                rotate=(not passive) and self._should_rotate(node_id, reason) and reason != "buffered_burst",
+                                rotate_on_failure=passive or reason == "buffered_burst",
+                            )
                     skip_ids.add(node_id)
                     continue
                 state.update({
@@ -1012,6 +1077,7 @@ class Guard:
         })
         if classification == "healthy":
             state["passive_soft_strikes"] = 0
+            state["passive_degrade_repeats"] = 0
             return
         if classification == "soft":
             state["passive_soft_strikes"] = int(state.get("passive_soft_strikes", 0)) + 1
@@ -1039,13 +1105,15 @@ class Guard:
             duration_ms=int(audit_value.get("durationMs") or 0),
             strikes=int(state.get("passive_soft_strikes", 0)),
         )
-        if classification == "hard":
-            self._quarantine(all_nodes, node, reason, now)
-            return
-        if self.config.fail_closed:
-            self._quarantine(all_nodes, node, reason, now)
-            return
-        self._probe_active(all_nodes, node, now, trigger="passive_confirmation")
+        log_event(
+            "passive_immediate_quarantine",
+            node_id=node_id,
+            node_name=node.get("name"),
+            classification=classification,
+            reason=reason,
+            output_tps=round(speed, 3),
+        )
+        self._quarantine(all_nodes, node, reason, now, recover_now=False)
 
     def run_passive_cycle(self) -> None:
         now = time.time()
