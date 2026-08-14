@@ -20,6 +20,7 @@ import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { DegradeAccountsPanel } from "@/features/quality-guard/degrade-accounts-panel";
+import { ProbeProfilesPanel } from "@/features/quality-guard/probe-profiles-panel";
 import { getQualityGuardStatus, runQualityTest, updateQualityGuardPolicy, type QualityGuardEvent, type QualityGuardNodeState, type QualityGuardPolicy, type QualityGuardStatistics, type QualityGuardStatus, type QualityTestResult } from "@/features/quality-guard/quality-guard-api";
 import { createEgressNode, deleteEgressNodes, listAllEgressNodes, updateEgressNode, updateEgressNodesEnabled, type EgressNodeDTO, type EgressNodeInput } from "@/features/settings/settings-api";
 import { ErrorState } from "@/shared/components/data-state";
@@ -164,8 +165,12 @@ export function QualityGuardPage() {
       <Tabs defaultValue="nodes">
         <TabsList>
           <TabsTrigger value="nodes">{t("qualityGuard.nodesTab")}</TabsTrigger>
+          <TabsTrigger value="profiles">{t("qualityGuard.profilesTab")}</TabsTrigger>
           <TabsTrigger value="accounts">{t("qualityGuard.degrade.tab")}</TabsTrigger>
         </TabsList>
+        <TabsContent value="profiles" className="mt-6">
+          <ProbeProfilesPanel />
+        </TabsContent>
         <TabsContent value="accounts" className="mt-6">
           <DegradeAccountsPanel softTPS={status?.config?.soft_tps} hardTPS={status?.config?.hard_tps} />
         </TabsContent>
@@ -397,6 +402,7 @@ function Policy({ status, onEdit }: { status: QualityGuardStatus; onEdit: () => 
     [t("qualityGuard.passiveInterval"), formatDuration(config.passive_poll_seconds)],
     [t("qualityGuard.quarantineDuration"), formatDuration(config.quarantine_seconds)],
     [t("qualityGuard.minimumNodes"), String(config.min_healthy_nodes)],
+    [t("qualityGuard.profilesTab"), status.profiles?.find((profile) => profile.id === status.activeProfileId)?.name ?? status.activeProfileId ?? "-"],
   ];
   return <section className="rounded-lg bg-card p-4 sm:p-5" aria-labelledby="guard-policy-title">
     <div className="flex items-center justify-between gap-3">
@@ -515,10 +521,9 @@ function qualityTestState(result: QualityTestResult, status: QualityGuardStatus)
   const hardTPS = status.config?.hard_tps ?? 1000;
   let classification = "healthy";
   let reason = "within_threshold";
-  if (!result.expectedMatched) { classification = "soft"; reason = "expected_marker_missing"; }
-  else if (result.outputTokens < 32) { classification = "soft"; reason = "insufficient_output_tokens"; }
-  else if (result.outputTokensPerSecond >= hardTPS) { classification = "hard"; reason = "hard_tps"; }
-  else if (result.outputTokensPerSecond >= softTPS) { classification = "soft"; reason = "soft_tps"; }
+  if (!result.expectedMatched) { classification = "hard"; reason = "expected_marker_missing"; }
+  else if (result.outputTokens >= 32 && result.outputTokensPerSecond >= hardTPS) { classification = "hard"; reason = "hard_tps"; }
+  else if (result.outputTokens >= 32 && result.outputTokensPerSecond >= softTPS) { classification = "soft"; reason = "soft_tps"; }
   const now = Date.now() / 1000;
   return {
     active_soft_strikes: classification === "soft" ? 1 : classification === "hard" ? (status.config?.consecutive_soft ?? 2) : 0,

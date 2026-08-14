@@ -81,6 +81,7 @@ class Config:
     state_file: Path
     lock_file: Path
     runtime_config_file: Path
+    profiles_file: Path = dataclasses.field(default_factory=lambda: Path("/var/lib/grok2api-quality-guard/profiles.json"))
 
     @classmethod
     def from_bootstrap(cls, path: Path = BOOTSTRAP_FILE) -> "Config":
@@ -132,6 +133,7 @@ class Config:
             state_file=Path("/var/lib/grok2api-quality-guard/state.json"),
             lock_file=Path("/var/lib/grok2api-quality-guard/guard.lock"),
             runtime_config_file=Path("/var/lib/grok2api-quality-guard/runtime-config.json"),
+            profiles_file=Path("/var/lib/grok2api-quality-guard/profiles.json"),
         )
         config.validate()
         return config
@@ -302,8 +304,9 @@ class ApiClient:
                 result.add(node_id)
         return result
 
-    def quality_test(self, node_id: str) -> dict[str, Any]:
-        return self._request("POST", f"{INTERNAL_API_PREFIX}/egress-nodes/{node_id}/quality-test")
+    def quality_test(self, node_id: str, profile_id: str = "") -> dict[str, Any]:
+        body = {"profileId": profile_id} if profile_id else {}
+        return self._request("POST", f"{INTERNAL_API_PREFIX}/egress-nodes/{node_id}/quality-test", body or None)
 
     def connectivity_test(self, node_id: str) -> dict[str, Any]:
         return self._request("POST", f"{INTERNAL_API_PREFIX}/egress-nodes/{node_id}/test")
@@ -350,8 +353,13 @@ class ApiClient:
         return payload
 
 
-def classify_result(result: dict[str, Any], config: Config) -> tuple[str, str]:
-    if not bool(result.get("expectedMatched")):
+def classify_result(result: dict[str, Any], config: Config, profile: dict[str, Any] | None = None) -> tuple[str, str]:
+    expected = ""
+    if profile:
+        expected = str(profile.get("expected_text") or profile.get("expected") or "").strip()
+    if expected and not bool(result.get("expectedMatched")):
+        return "hard", "expected_marker_missing"
+    if profile is None and not bool(result.get("expectedMatched")):
         return "soft", "expected_marker_missing"
     output_tokens = int(result.get("outputTokens") or result.get("visibleTokens") or 0)
     speed_value = result.get("outputTokensPerSecond")
@@ -362,6 +370,14 @@ def classify_result(result: dict[str, Any], config: Config) -> tuple[str, str]:
     generation_ms = int(result.get("generationMs") or 0)
     if generation_ms <= 0:
         generation_ms = max(0, int(result.get("durationMs") or 0) - int(result.get("firstTokenMs") or 0))
+    # Marker profiles treat content compliance as the primary signal. A short
+    # QUALITY_OK reply should not be punished for token count or burst TPS.
+    if expected and bool(result.get("expectedMatched")):
+        if output_tokens >= 32 and speed >= config.hard_tps:
+            return "hard", "hard_tps"
+        if output_tokens >= 32 and speed >= config.soft_tps:
+            return "soft", "soft_tps"
+        return "healthy", "within_threshold"
     if output_tokens < 32:
         return "soft", "insufficient_output_tokens"
     if config.fail_closed and generation_ms < config.min_generation_ms:
@@ -371,6 +387,35 @@ def classify_result(result: dict[str, Any], config: Config) -> tuple[str, str]:
     if speed >= config.soft_tps:
         return "soft", "soft_tps"
     return "healthy", "within_threshold"
+
+
+def load_probe_profiles(path: Path) -> dict[str, Any]:
+    data = {"version": 1, "active_profile_id": "quality-marker", "profiles": {}}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        if isinstance(loaded, dict):
+            data.update(loaded)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError):
+        pass
+    profiles = data.get("profiles")
+    if not isinstance(profiles, dict):
+        profiles = {}
+        data["profiles"] = profiles
+    return data
+
+
+def resolve_probe_profile(path: Path, profile_id: str = "") -> tuple[str, dict[str, Any] | None]:
+    data = load_probe_profiles(path)
+    profiles = data.get("profiles") if isinstance(data.get("profiles"), dict) else {}
+    active = str(data.get("active_profile_id") or "quality-marker")
+    chosen = str(profile_id or active)
+    profile = profiles.get(chosen)
+    if isinstance(profile, dict):
+        return chosen, profile
+    return chosen, None
 
 
 def classify_audit(value: dict[str, Any], config: Config) -> tuple[str, str, float, int]:
@@ -538,6 +583,7 @@ class Guard:
             "rotatable_node_ids": list(self.config.rotatable_node_ids),
             "prompt": self.config.prompt,
             "expected": self.config.expected,
+            "active_profile_id": resolve_probe_profile(self.config.profiles_file)[0],
         }
 
     def _save(self) -> None:
@@ -701,8 +747,9 @@ class Guard:
         if state.get("last_reason") == "probe_no_account" and now < float(state.get("quarantined_until", 0.0)):
             return
         self._bump_statistic("active", "total")
+        profile_id, profile = resolve_probe_profile(self.config.profiles_file)
         try:
-            result = self.api.quality_test(node_id)
+            result = self.api.quality_test(node_id, profile_id)
         except Exception as exc:
             if self._probe_account_unavailable(exc):
                 self._defer_no_account(state, node, now, "quality_probe_deferred", trigger=trigger)
@@ -714,7 +761,7 @@ class Guard:
             if trigger == "scheduled" and state["error_strikes"] >= self.config.consecutive_errors:
                 self._quarantine(nodes, node, "probe_errors", now)
             return
-        classification, reason = classify_result(result, self.config)
+        classification, reason = classify_result(result, self.config, profile)
         self._record_probe(node, result, classification, reason, now)
         if classification == "hard" or (
             classification == "soft" and self.config.fail_closed
@@ -760,8 +807,9 @@ class Guard:
                 connectivity_status = "error"
                 log_event("recovery_connectivity_probe_failed", node_id=node_id, node_name=node.get("name"), error_type=type(exc).__name__)
             self._bump_statistic("active", "total")
-            result = self.api.quality_test(node_id)
-            classification, reason = classify_result(result, self.config)
+            profile_id, profile = resolve_probe_profile(self.config.profiles_file)
+            result = self.api.quality_test(node_id, profile_id)
+            classification, reason = classify_result(result, self.config, profile)
             self._record_probe(node, result, classification, reason, now)
         except Exception as exc:
             if self._probe_account_unavailable(exc):

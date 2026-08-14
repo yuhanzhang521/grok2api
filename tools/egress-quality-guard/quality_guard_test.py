@@ -40,10 +40,12 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(quality_guard.classify_result({"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 500}, cfg)[0], "soft")
         self.assertEqual(quality_guard.classify_result({"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 1000}, cfg)[0], "hard")
 
-    def test_missing_marker_and_short_response_are_soft_failures(self):
+    def test_missing_marker_is_hard_and_short_marker_hit_is_healthy(self):
         cfg = config()
-        self.assertEqual(quality_guard.classify_result({"expectedMatched": False, "outputTokens": 100, "outputTokensPerSecond": 10}, cfg), ("soft", "expected_marker_missing"))
-        self.assertEqual(quality_guard.classify_result({"expectedMatched": True, "outputTokens": 12, "outputTokensPerSecond": 10}, cfg), ("soft", "insufficient_output_tokens"))
+        marker = {"expected_text": "QUALITY_OK", "match_mode": "last_line"}
+        self.assertEqual(quality_guard.classify_result({"expectedMatched": False, "outputTokens": 100, "outputTokensPerSecond": 10}, cfg, marker), ("hard", "expected_marker_missing"))
+        self.assertEqual(quality_guard.classify_result({"expectedMatched": True, "outputTokens": 12, "outputTokensPerSecond": 8000}, cfg, marker), ("healthy", "within_threshold"))
+        self.assertEqual(quality_guard.classify_result({"expectedMatched": True, "outputTokens": 12, "outputTokensPerSecond": 10}, cfg, {"expected_text": ""}), ("soft", "insufficient_output_tokens"))
 
     def test_passive_speed_matches_panel_and_includes_reasoning_tokens(self):
         cfg = config()
@@ -185,7 +187,7 @@ class FakeApi:
     def fixed_fallback_node_ids(self):
         return set(self.fixed_fallback_ids)
 
-    def quality_test(self, node_id):
+    def quality_test(self, node_id, profile_id=""):
         self.quality_calls.append(node_id)
         value = self.results.pop(0)
         if isinstance(value, Exception):
